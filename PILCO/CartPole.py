@@ -1,12 +1,12 @@
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+from jax import jit
 from jaxutils import Dataset
 import objax
 import optax as ox
 import jaxkern as jk
 import gpjax as gpx
-
 import matplotlib.pyplot as plt
 
 ### SETTINGS
@@ -86,30 +86,44 @@ def CartPole():
 ### PILCO
 
 class MGPR():
-    def __init__(self, x_train, y_train):
+    def __init__(self, D):
         super(MGPR, self).__init__()
-        self.num_inputs = x_train.shape[1]
-        self.num_ouputs = y_train.shape[1]
-        self.n_data_points = x_train.shape[0]
+        self.num_inputs = D.X.shape[1]
+        self.num_ouputs = D.y.shape[1]
+        self.n_data_points = D.X.shape[0]
 
-        self.models = []
-        self.create_models(x_train, y_train)
+        self.modelparams = []
+        self.posteriors = []
 
-    def create_models(self):
+        self.create_models(D)
+
+    def create_models(self, D):
         for i in range(self.num_ouputs):
-            kernel = gpx.kernels.RBF()
-            prior = gpx.gps.Prior(kernel=kernel)
-            likelihood = gpx.likelihoods.Gaussian(num_datapoints=self.n_data_points)
-            posterior = prior * likelihood
+            pass
 
-            model = gpx.initialise(
-                posterior, key, kernel
-            )
-
-            self.models.append(model)
+    def optimize(self, D):
+        pass
 
 class PILCO():
-    pass
+    def __init__(self, D, policy, cost, horizon, m_init=None, s_init=None, name="PILCO"):
+        super(PILCO, self).__init__(name)
+
+        self.state_dim = D.y.shape[1]
+        self.control_dim = D.X.shape[1] - D.y.shape[1]
+        self.horizon = horizon
+
+        if m_init is None or s_init is None:
+            self.m_init = D.X[0:1, 0:self.state_dim]
+            self.s_init = jnp.diag(jnp.ones(self.state_dim) * 0.1)
+        else:
+            self.m_init = m_init
+            self.s_init = s_init
+
+        self.dynamics_model = MGPR(D)
+
+        self.policy = policy
+        
+        self.cost = cost
 
 class RBFN(MGPR):
     def __init__(self, state_dim, control_dim, n, name="RBFN Policy"):
@@ -155,7 +169,7 @@ control_dim = D.X.shape[1] - state_dim
 
 learnedPolicy = RBFN(state_dim=state_dim, control_dim=control_dim, n=numBasisFunctions)
 
-pilco = PILCO(D, controller=learnedPolicy, horizon=T) # init pilco with data D, RBF controller with 50 basis functions, with T = 40
+pilco = PILCO(D=D, controller=learnedPolicy, horizon=T) # init pilco with data D, RBF controller with 50 basis functions, with T = 40
 
 for rollout in range(num_rollouts):
     import pdb
