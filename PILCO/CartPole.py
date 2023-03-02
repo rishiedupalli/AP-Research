@@ -1,12 +1,15 @@
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-from jax import jit
-from jaxutils import Dataset
+
 import objax
 import optax as ox
 import jaxkern as jk
 import gpjax as gpx
+
+from jax import jit, grad, vmap
+from jaxutils import Dataset
+
 import matplotlib.pyplot as plt
 
 ### SETTINGS
@@ -14,7 +17,7 @@ import matplotlib.pyplot as plt
 # General
 
 key = jr.PRNGKey(123)
-simTimesteps = 25 # number of seconds cartpole is ran
+simTimesteps = 25 # number of deciseconds cartpole is ran
 
 # PILCO
 
@@ -86,25 +89,70 @@ def CartPole():
 ### PILCO
 
 class MGPR():
-    def __init__(self, D):
+    """
+    multiple gaussian process regression
+    creates a gp for every dimension in input for dynamics learning
+    """
+    def __init__(self, D, name=None):
         super(MGPR, self).__init__()
         self.num_inputs = D.X.shape[1]
         self.num_ouputs = D.y.shape[1]
         self.n_data_points = D.X.shape[0]
 
-        self.modelparams = []
-        self.posteriors = []
+        self.models = []
 
         self.create_models(D)
 
     def create_models(self, D):
         for i in range(self.num_ouputs):
-            pass
+            kernel = jk.RBF()
+            prior = gpx.Prior(kernel=kernel)
 
-    def optimize(self, D):
+            likelihood = gpx.Gaussian(num_datapoints=D.n)
+            posterior = prior * likelihood
+
+            parameter_state = gpx.initialise(
+                posterior, key, kernel
+            )
+
+            self.models.append(parameter_state)
+
+    def optimize_models(self, D):
+        # optimize gp models
+        new_models = []
+
+        for model in self.models:
+            kernel = jk.RBF()
+            prior = gpx.Prior(kernel=kernel)
+
+            likelihood = gpx.Gaussian(num_datapoints=D.n)
+            posterior = prior * likelihood
+
+            negative_mll = jit(posterior.marginal_log_likelihood(D, negative=True))
+            optimizer = ox.adam(learning_rate=0.01)
+
+            inference_state = gpx.fit(
+                objective=negative_mll,
+                parameter_state=model,
+                optax_optim=optimizer,
+                num_iters=500
+            )
+
+            new_models.append(inference_state)
+
+        self.models = new_models        
+
+    def optimize_policy(self, D):
+
         pass
 
+class RBFN(MGPR):
+    # RBF controller but its actually a degenerate GP
+    def __init__(self, state_dim, control_dim, n, name="RBFN Policy"):
+        MGPR.__init__(self)      
+
 class PILCO():
+    # Probabilistic Inference for Learning Control algorithm
     def __init__(self, D, policy, cost, horizon, m_init=None, s_init=None, name="PILCO"):
         super(PILCO, self).__init__(name)
 
@@ -121,14 +169,13 @@ class PILCO():
 
         self.dynamics_model = MGPR(D)
 
-        self.policy = policy
+        self.controller = policy
         
         self.cost = cost
 
-class RBFN(MGPR):
-    def __init__(self, state_dim, control_dim, n, name="RBFN Policy"):
-        MGPR.__init__(self)
-    
+    def optimize(self):
+        self.dynamics_model.optimize()
+        self.controller.optimize()
 
 ### UTILITY
 
@@ -167,11 +214,13 @@ D = Dataset(X=X1,y=X2)
 state_dim = D.y.shape[1]
 control_dim = D.X.shape[1] - state_dim
 
-learnedPolicy = RBFN(state_dim=state_dim, control_dim=control_dim, n=numBasisFunctions)
+Policy = RBFN(state_dim=state_dim, control_dim=control_dim, n=numBasisFunctions)
 
-pilco = PILCO(D=D, controller=learnedPolicy, horizon=T) # init pilco with data D, RBF controller with 50 basis functions, with T = 40
+pilco = PILCO(D=D, controller=Policy, horizon=T) # init pilco with data D, RBF controller with 50 basis functions, with T = 40
 
 for rollout in range(num_rollouts):
+
     import pdb
     pdb.set_trace()
+
     pass
