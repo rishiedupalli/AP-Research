@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import jax.scipy as jsp
 import jax.random as jr
 
 import objax
@@ -105,7 +106,7 @@ class MGPR():
 
     def create_models(self, D):
         for i in range(self.num_ouputs):
-            kernel = jk.RBF()
+            kernel = jk.RBF(active_dims=[0, 1, 2, 3])
             prior = gpx.Prior(kernel=kernel)
 
             likelihood = gpx.Gaussian(num_datapoints=D.n)
@@ -117,12 +118,12 @@ class MGPR():
 
             self.models.append(parameter_state)
 
-    def optimize_models(self, D):
+    def optimize(self, D):
         # optimize gp models
         new_models = []
 
         for model in self.models:
-            kernel = jk.RBF()
+            kernel = jk.RBF(active_dims=[0, 1, 2, 3])
             prior = gpx.Prior(kernel=kernel)
 
             likelihood = gpx.Gaussian(num_datapoints=D.n)
@@ -140,19 +141,42 @@ class MGPR():
 
             new_models.append(inference_state)
 
-        self.models = new_models        
+        self.models = new_models
 
-    def optimize_policy(self, D):
-
+    def calculate_factorizations(self):
         pass
+    
 
 class RBFN(MGPR):
     # RBF controller but its actually a degenerate GP
-    def __init__(self, state_dim, control_dim, n, name="RBFN Policy"):
-        MGPR.__init__(self)      
+    
+    def __init__(self, state_dim, control_dim, num_basis, name="RBFN Policy"):
+        self.vars = Dataset(X=objax.random.normal((num_basis, state_dim)),y=0.1*objax.random.normal(num_basis, control_dim))
+        MGPR.__init__(self, self.vars)
+
+    def create_models(self, data):
+        self.models = []
+        for i in range(self.num_ouputs):
+            kernel = jax.RBF(active_dims=[0, 1, 2, 3])
+            prior = gpx.Prior(kernel=kernel)
+
+            likelihood = gpx.Gaussian(num_datapoints=D.n)
+            posterior = prior * likelihood
+
+            parameter_state = gpx.initialise(
+                posterior, key, kernel
+            )
+
+            self.models.append(parameter_state)
+
+    def compute_action(self, m, s, squash=True):
+        iK, beta = self.calculate_factorizations()
+
+
 
 class PILCO():
     # Probabilistic Inference for Learning Control algorithm
+
     def __init__(self, D, policy, cost, horizon, m_init=None, s_init=None, name="PILCO"):
         super(PILCO, self).__init__(name)
 
@@ -175,9 +199,53 @@ class PILCO():
 
     def optimize(self):
         self.dynamics_model.optimize()
-        self.controller.optimize()
+
+    def optimize_policy(self, maxiter=500, restarts=1):
+        
+        lr = 0.01
+        if not self.optimizer:
+            opt_hyperparams = objax.optimizer.Adam(self.controller.vars)
+            energy = objax.GradValues(self.training_loss, self.controller.vars)
+
+    def training_loss(self):
+        predictions = self.predict(self.m_init, self.s_init, self.horizon)
+        _, _, reward = predictions
+        return -reward
+    
+    def predict(self, m_x, s_x, n):
+        init_val = (m_x, s_x, n)
+
+        def body_fun(i, v):
+            m_x, s_x, reward = v
+            return (
+                *self.propagate(m_x, s_x),
+                
+            )
+        
+    def propagate(self, m_x, s_x):
+        m_u, s_u, c_xu = self.controller.compute_action(m_x, s_x)
 
 ### UTILITY
+
+def squash_sin(m, s, max_action=10):
+    k = jnp.shape(m)[1]
+    max_action = max_action * jnp.ones((1, k))
+
+    M = max_action * jnp.exp(-0.5 * jnp.diag(s)) * jnp.sin(m)
+
+    lq = -0.5 * (jnp.diag(s)[:, None] + jnp.diag(s)[None, :])
+    q = jnp.exp(lq)
+    mT = jnp.transpose(m, (1, 0))
+    S = (jnp.exp(lq + s) - q) * jnp.cos(mT - m) - (jnp.exp(lq - s) - q) * jnp.cos(
+        mT + m
+    )
+    S = 0.5 * max_action * jnp.transpose(max_action, (1, 0)) * S
+
+    C = max_action * objax.Vectorize(lambda x: jnp.diag(x, k=0), objax.VarCollection())(
+        jnp.exp(-0.5 * jnp.diag(s)) * jnp.cos(m)
+    )
+
+    return M, S, C.reshape((k, k))
 
 def random_rollout():
     X = []
