@@ -3,6 +3,8 @@ import jax.numpy as jnp
 import jax.scipy as jsp
 import jax.random as jr
 
+from jax.lax import fori_loop
+
 import objax
 import optax as ox
 import jaxkern as jk
@@ -86,7 +88,6 @@ def CartPole():
         cost = 1 - jnp.exp(-0.5 * dist * 1/(variance**2))
         return cost
 
-
 ### PILCO
 
 class MGPR():
@@ -102,14 +103,18 @@ class MGPR():
 
         self.models = []
 
+        self.x_train = []
+        self.y_train = []
+
         self.create_models(D)
+        self.set_XY(D)
 
     def create_models(self, D):
         for i in range(self.num_ouputs):
             kernel = jk.RBF(active_dims=[0, 1, 2, 3])
             prior = gpx.Prior(kernel=kernel)
 
-            likelihood = gpx.Gaussian(num_datapoints=D.n)
+            likelihood = gpx.Gaussian(num_datapoints=D.X.shape[0])
             posterior = prior * likelihood
 
             parameter_state = gpx.initialise(
@@ -118,18 +123,32 @@ class MGPR():
 
             self.models.append(parameter_state)
 
+    def set_XY(self, D):
+        new_x = []
+        new_y = []
+
+        for i in range(len(self.models)):
+            self.new_x.append(D.X)
+            self.new_y.append(D.y[:, i:i + 1])
+
+        self.x_train = new_x
+        self.y_train = new_y
+
     def optimize(self, D):
         # optimize gp models
         new_models = []
 
-        for model in self.models:
+        for model, x_t, y_t in zip(self.models, self.x_train, self.y_train):
+            
             kernel = jk.RBF(active_dims=[0, 1, 2, 3])
             prior = gpx.Prior(kernel=kernel)
 
-            likelihood = gpx.Gaussian(num_datapoints=D.n)
+            likelihood = gpx.Gaussian(num_datapoints=D.X.shape[0])
             posterior = prior * likelihood
 
-            negative_mll = jit(posterior.marginal_log_likelihood(D, negative=True))
+            D_Train = Dataset(X=x_t, y=y_t)
+
+            negative_mll = jit(posterior.marginal_log_likelihood(D_Train, negative=True))
             optimizer = ox.adam(learning_rate=0.01)
 
             inference_state = gpx.fit(
@@ -144,8 +163,106 @@ class MGPR():
         self.models = new_models
 
     def calculate_factorizations(self):
-        pass
+        K = self.K(self.X, self.X)
+        batched_eye = jnp.expand_dims(jnp.eye(jnp.shape(self.X)[0]), axis=0).repeat(
+            self.num_outputs, axis=0
+        )
+        L = jsp.linalg.cho_factor(
+            K + self.noise[:, None, None] * batched_eye, lower=True
+        )
+        iK = jsp.linalg.cho_solve(L, batched_eye)
+        Y_ = jnp.transpose(self.Y)[:, :, None]
+        beta = jsp.linalg.cho_solve(L, Y_)[:, :, 0]
+        return iK, beta
     
+    def predict_given_factorizations(self, m, s, iK, beta):
+        s = jnp.tile(s[None, None, :, :], [self.num_outputs, self.num_outputs, 1, 1])
+        inp = jnp.tile(self.centralized_input(m)[None, :, :], [self.num_outputs, 1, 1])
+
+        iL = objax.Vectorize(lambda x: jnp.diag(x, k=0), objax.VarCollection())(
+            1 / self.lengthscales
+        )
+
+        iN = inp @ iL
+        B = iL @ s[0, ...] @ iL + jnp.eye(self.num_dims)
+
+        t = jnp.transpose(
+            jnp.linalg.solve(B, jnp.transpose(iN, axes=(0, 2, 1))),
+            axes=(0, 2, 1),
+        )
+
+        lb = jnp.exp(-0.5 * jnp.sum(iN * t, -1)) * beta
+        tiL = t @ iL
+        c = self.variance / jnp.sqrt(jnp.linalg.det(B))
+
+        M = (jnp.sum(lb, -1) * c)[:, None]
+        V = (jnp.transpose(tiL, axes=(0, 2, 1)) @ lb[:, :, None])[..., 0] * c[:, None]
+
+        z = objax.Vectorize(
+            objax.Vectorize(lambda x: jnp.diag(x, k=0), objax.VarCollection()),
+            objax.VarCollection(),
+        )(
+            1.0 / jnp.square(self.lengthscales[None, :, :])
+            + 1.0 / jnp.square(self.lengthscales[:, None, :])
+        )
+
+        R = (s @ z) + jnp.eye(self.num_dims)
+
+        X = inp[None, :, :, :] / jnp.square(self.lengthscales[:, None, None, :])
+        X2 = -inp[:, None, :, :] / jnp.square(self.lengthscales[None, :, None, :])
+        Q = 0.5 * jnp.linalg.solve(R, s)
+        maha = (X - X2) @ Q @ jnp.transpose(X - X2, axes=(0, 1, 3, 2))
+
+        k = jnp.log(self.variance)[:, None] - 0.5 * jnp.sum(jnp.square(iN), -1)
+        L = jnp.exp(k[:, None, :, None] + k[None, :, None, :] + maha)
+        S = (
+            jnp.tile(beta[:, None, None, :], [1, self.num_outputs, 1, 1])
+            @ L
+            @ jnp.tile(beta[None, :, :, None], [self.num_outputs, 1, 1, 1])
+        )[:, :, 0, 0]
+
+        diagL = jnp.transpose(
+            objax.Vectorize(
+                objax.Vectorize(lambda x: jnp.diag(x, k=0), objax.VarCollection()),
+                objax.VarCollection(),
+            )(jnp.transpose(L))
+        )
+        S = S - jnp.diag(jnp.sum(jnp.multiply(iK, diagL), [1, 2]))
+        S = S / jnp.sqrt(jnp.linalg.det(R))
+        S = S + jnp.diag(self.variance)
+        S = S - M @ jnp.transpose(M)
+
+        return jnp.transpose(M), S, jnp.transpose(V)
+    
+    def predict_on_noisy_inputs(self, m, s):
+        iK, beta = self.calculate_factorizations()
+        return self.predict_given_factorizations(m,s, iK, beta)
+
+    def centralized_input(self, m):
+        return self.X - m
+    
+    def K(self, X1, X2=None):
+        return jnp.stack([model.kernel.__call__(X1, X2) for model in self.models])
+    
+    @property
+    def Y(self):
+        return jnp.concatenate([self.x_train])
+    
+    @property
+    def X(self):
+        return self.x_train[0]
+    
+    @property
+    def lengthscales(self):
+        return jnp.stack([model.kernel.lengthscale for model in self.models])
+    
+    @property
+    def variance(self):
+        return jnp.stack([model.kernel.variance for model in self.models])
+    
+    @property
+    def noise(self):
+        return jnp.stack([model.likelihood.obs_noise for model in self.models])
 
 class RBFN(MGPR):
     # RBF controller but its actually a degenerate GP
@@ -171,7 +288,14 @@ class RBFN(MGPR):
 
     def compute_action(self, m, s, squash=True):
         iK, beta = self.calculate_factorizations()
+        M, S, V = self.predict_given_factorizations(m, s, 0.0, beta)
 
+        S = S - jnp.diag(self.variance - 1e-6)
+
+        if squash:
+            M, S, V2 = squash_sin(M, S, self.max_action)
+            V = V @ V2
+        return M, S, V
 
 
 class PILCO():
@@ -185,7 +309,7 @@ class PILCO():
         self.horizon = horizon
 
         if m_init is None or s_init is None:
-            self.m_init = D.X[0:1, 0:self.state_dim]
+            self.m_init = D.X[0:1, 0:self.stWate_dim]
             self.s_init = jnp.diag(jnp.ones(self.state_dim) * 0.1)
         else:
             self.m_init = m_init
@@ -212,18 +336,41 @@ class PILCO():
         _, _, reward = predictions
         return -reward
     
-    def predict(self, m_x, s_x, n):
-        init_val = (m_x, s_x, n)
+    def predict(self, m_x, s_x, T):
+
+        init_val = (m_x, s_x, 0.0)
 
         def body_fun(i, v):
             m_x, s_x, reward = v
             return (
                 *self.propagate(m_x, s_x),
-                
+                jnp.add(reward, jnp.squeeze(self.reward.compute_reward(m_x, s_x)[0])),
             )
+
+        val = fori_loop(0, T, body_fun, init_val)
+
+        m_x, s_x, reward = val
+        return m_x, s_x, reward
         
     def propagate(self, m_x, s_x):
         m_u, s_u, c_xu = self.controller.compute_action(m_x, s_x)
+
+        m = jnp.concatenate([m_x, m_u], axis=1)
+        s1 = jnp.concatenate([s_x, s_x @ c_xu], axis=1)
+        s2 = jnp.concatenate([jnp.transpose(s_x @ c_xu), s_u], axis=1)
+        s = jnp.concatenate([s1, s2], axis=0)
+
+        M_dx, S_dx, C_dx = self.dynamics_model.predict_on_noisy_inputs(m, s)
+        M_x = M_dx + m_x
+        
+        S_x = S_dx + s_x + s1 @ C_dx + C_dx.T @ s1.T
+
+        return M_x, S_x
+    
+class SaturatingCost():
+    def __init__(self):
+        pass
+
 
 ### UTILITY
 
@@ -254,7 +401,7 @@ def random_rollout():
     x_t1 = jnp.array([0, 0, 0, 0]) # reset environment
 
     for dt in range(simTimesteps):
-        u = jr.uniform(key, 1, int, -10,10) # apply a random force of x \in [-10.10] newtons
+        u = jr.uniform(key, 1, int, -10.0, 10.0) # apply a random force of x \in [-10.10] newtons
         x_t2 = env.step(x_t1, u)
 
         X.append(jnp.hstack((x_t1,u)))
