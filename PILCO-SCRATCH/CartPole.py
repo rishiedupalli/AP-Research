@@ -241,6 +241,59 @@ for rollout in range(num_rollouts):
 
         DeltaCov = []
 
+        for a in range(num_outputs):
+
+            row = []
+
+            for b in range(num_outputs):
+
+                GP_Params_A, _ = DynamicsModels[a].unpack()
+                GP_Params_B, _ = DynamicsModels[b].unpack()
+
+                GP_Ax = DynamicsModelsData[a].X
+                GP_Ay = DynamicsModelsData[a].y
+
+                GP_Bx = DynamicsModelsData[b].Y
+                GP_By = DynamicsModelsData[b].y
+
+                K_A = RBF_Kernel.cross_covariance(GP_Params_A['kernel'], GP_Ax, GP_Ax)
+                K_B = RBF_Kernel.cross_covariance(GP_Params_B['kernel'], GP_Bx, GP_Bx)
+
+                Beta_A = jnp.linalg.inv(K_A) @ GP_Ay
+
+                Beta_B = jnp.linalg.inv(K_b) @ GP_Bx
+
+                Q = []
+
+                Lambda_A = GP_Params_A['kernel']['lengthscale']
+
+                Lambda_B = GP_Params_B['kernel']['lengthscale']
+
+                for i in X_Final: # Calculate Entries of Q_ij
+                    
+                    row = []
+
+                    for j in X_Final:
+
+                        k_a = RBF_Kernel.__call__(GP_Params_A['kernel'], i, M_ts1)
+
+                        k_b = RBF_Kernel.__call__(GP_Params_B['kernel'], j, M_ts1)
+
+                        R = S_ts1 @ (jnp.linalg.inv(Lambda_A) + jnp.linalg.inv(Lambda_B)) + jnp.eye(num_outputs + 1)
+
+                        z = (jnp.linalg.inv(Lambda_A) @ (i - M_ts1)) + (jnp.linalg.inv(Lambda_B) @ (j - M_ts1))
+
+                        A = (k_a * k_b) / jnp.sqrt(jnp.abs( jnp.linalg.det(R)))
+
+                        B = jnp.exp(0.5 * (jnp.linalg.transpose(z) @ jnp.linalg.inv(R) @ S_ts1 @ z))
+
+                        row.append(A*B)
+
+                if (a == b):
+
+                else:
+
+
         # Calculate N(x_t+1 | \mu_{t-1}, \Sigma_{x_{t-1})
 
     # Evaluate J^{\pi}
