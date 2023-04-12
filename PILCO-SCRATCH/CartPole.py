@@ -25,6 +25,8 @@ import random
 
 # General
 
+jax.config.update("jax_enable_x64", True)
+
 simTimesteps = 2.5 # x number of seconds cartpole is ran
 key = jr.PRNGKey(12345)
 
@@ -32,7 +34,7 @@ key = jr.PRNGKey(12345)
 
 num_random_rollouts = 1 # number of random rollouts
 num_rollouts = 15 # Number of PILCO rollouts
-T = 40 # PILCO run time, how long to stay under policy \pi
+T = 25 # PILCO run time, how long to stay under policy \pi
 numBasisFunctions = 50 # number of RBF basis functions
 
 # CART POLE
@@ -136,6 +138,8 @@ RBF_Kernel = jk.RBF(active_dims=[0,1,2,3,4])
 
 for rollout in range(num_rollouts):
     print("PILCO Iteration " + str(rollout + 1))
+
+    import pdb
     
     ### Step 3: Learn GP Dynamics Models
 
@@ -192,7 +196,6 @@ for rollout in range(num_rollouts):
         latent_dist = posterior(learned_params, Data)(Data.X)
         predictive_dist = likelihood(learned_params, latent_dist)
 
-
     ### Step 4: Policy Generation & Optimization
 
     ## Constants
@@ -235,7 +238,7 @@ for rollout in range(num_rollouts):
 
             DeltaMu.append(jnp.transpose(Beta) @ q)
 
-        New_Mean = jnp.asarray(DeltaMu)
+        DeltaMu = jnp.asarray(DeltaMu)
 
         # Calculate Covariance of N(x_t+1 | \mu_{t-1}, \Sigma_{x_{t-1})
 
@@ -279,8 +282,6 @@ for rollout in range(num_rollouts):
 
                     for j in X_Final:
 
-                        print('Calculating Q_' + str(i) + str(j) + 'for iteration ' + '(' + str(a) + ', ' + str(b) + ')')
-
                         k_a = RBF_Kernel.__call__(GP_Params_A['kernel'], i, M_ts1)
 
                         k_b = RBF_Kernel.__call__(GP_Params_B['kernel'], j, M_ts1)
@@ -291,7 +292,9 @@ for rollout in range(num_rollouts):
 
                         B = jnp.exp(0.5 * (jnp.transpose(z) @ jnp.linalg.inv(R) @ (S_ts1 * z)))
 
-                        Q_Row.append(A*B)
+                        Q_Row.append(jnp.nan_to_num(A*B))
+
+                        print('Calculating Q_' + str(i) + str(j) + ' @ ' + '(' + str(a) + ', ' + str(b) + ') = ' + str(A*B))
 
                     Q.append(Q_Row)
 
@@ -301,24 +304,36 @@ for rollout in range(num_rollouts):
 
                 E_fts1 = 1 - jnp.trace(K_a @ Q)
 
-                E_fxts1 = (jnp.transpose(Beta_A) @ Q @ Beta_B)
+                print(E_fts1)
+
+                E_fxts1 =  jnp.mean((jnp.transpose(Beta_A) @ Q @ Beta_B))
+
+                print(E_fxts1)
 
                 if (a == b):
                     s_aa = E_fts1 + E_fxts1 - (DeltaMu[a] * DeltaMu[a])
-                    DeltaSigma_Row.append(s_aa)
+                    DeltaSigma_Row.append(jnp.nan_to_num(s_aa))
+                    print(s_aa)
                 else:
                     s_ab = E_fxts1 - DeltaMu[a] * DeltaMu[b]
-                    DeltaSigma_Row.append(s_ab)
+                    DeltaSigma_Row.append(jnp.nan_to_num(s_ab))
+                    print(s_ab)  
 
+            DeltaSigma_Row = jnp.asarray(DeltaSigma_Row)
             DeltaSigma.append(DeltaSigma_Row)
 
-        DeltaSigma = jnp.asarray(DeltaSigma)      
+        DeltaSigma = jnp.asarray(DeltaSigma)
 
         # Calculate N(x_t | \mu_{t}, \Sigma_{x_{t})
 
-        M_t = M_ts1 + DeltaMu
-        S_t = S_ts1 + DeltaSigma + jnp.cov(X_Final[T_Step],Y_Final[T_Step]) + jnp.cov[Y_Final[T_Step],X_Final[T_Step]]
+        pdb.set_trace()
 
-        x_tp1_pred = jr.multivariate_normal(key, M_t, S_t)
+        M_t = M_ts1[:4] + DeltaMu.flatten()
+
+        S_t = S_ts1 + DeltaSigma.flatten().reshape(4,4)
+
+        N_t = dx.MultivariateNormalFullCovariance(M_t, S_t)
+
+        x_t = N_t.sample(seed=key)
 
     # Evaluate J^{\pi}
