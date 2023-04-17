@@ -6,6 +6,7 @@ import jax
 import objax
 import jax.numpy as jnp
 import jax.scipy as jsp
+import jax.scipy
 import jax.random as jr
 import distrax as dx
 
@@ -19,7 +20,7 @@ from jax import jit, grad, vmap
 from jaxutils import Dataset
 
 import matplotlib.pyplot as plt
-import random
+import scipy.integrate as spint
 
 ### SETTINGS
 
@@ -36,6 +37,7 @@ num_random_rollouts = 1 # number of random rollouts
 num_rollouts = 15 # Number of PILCO rollouts
 T = 25 # PILCO run time, how long to stay under policy \pi
 numBasisFunctions = 50 # number of RBF basis functions
+input_dim = 4
 
 # CART POLE
 
@@ -47,6 +49,10 @@ massPendulum = 0.5 # mass of pendulum
 
 a_g = 9.82 # accleration due to gravity
 mu = 0.1 # friction coeff
+
+# Testing
+
+CalcCov = False
 
 ### CART POLE IMPLEMENTATION
 
@@ -83,25 +89,36 @@ class CartPole():
 ### RBF Controller
 
 class RBFController():
-    def __init__(self, state_dim, num_basis_functions):
-        self.theta_init = {
-            'weights': np.random.normal(size=(1, num_basis_functions)),
-            'lambda': np.random.normal(size=(1, state_dim)),
-            'centers': np.random.normal(size=(1, num_basis_functions))
-        }
+    def __init__(self, input_dim, num_basis_functions):
+        self.num_basis_functions = num_basis_functions
+        self.input_dim = input_dim
+        self.centers = jr.normal(key, (self.num_basis_functions, self.input_dim))
+        self.weights = jr.normal(key, (self.num_basis_functions,))
+        self.Lambda = jnp.diag(jr.normal(key, (1, self.input_dim)).flatten())
 
-    def Random_Policy(self, x):
-        return random.randrange(-10,10)
+    def rbf_kernel(self, x, mu_i):
+        dist = (x - mu_i).T @ self.Lambda @ (x - mu_i)
+        return jnp.exp(-.05 * dist)
+    
+    def compute_action(self, x):
+        sum = []
+        for mu_i, w in zip(self.centers, self.weights):
+            phi = self.rbf_kernel(x, mu_i)
+            sum.append(jnp.dot(w, phi))
 
-    def Network(x: jnp.ndarray, theta: jnp.ndarray) -> jnp.ndarray:
-        u = 0
-        return u
+        return jnp.sum(jnp.asarray(sum))
+    
+def J_under_pi(x, t, m, s):
+    return (1 - jnp.exp(-((jnp.abs(x - t)**2 )/0.25))) * ((jnp.exp(-0.5 * (x - m).T @ s.T @ (x-m))) / (jnp.sqrt( 2 * jnp.pi )**4 * jnp.linalg.det(s)))
+
 
 ### PILCO
 
 Env = CartPole()
 
-Controller = RBFController(state_dim=4, num_basis_functions=50)
+Target = jnp.array([0,0, jnp.pi, 0])
+
+Controller = RBFController(input_dim=input_dim, num_basis_functions=numBasisFunctions)
 
 # Step 1: Apply random control signals u and record initial data
 
@@ -112,7 +129,7 @@ def random_rollout():
     x_t1 = jnp.array([0., 0., 0., 0.]) # reset environment
 
     for dt in range(int(simTimesteps*10)):
-        u = Controller.Random_Policy(x_t1) # apply a random force of x \in [-10,10] newtons based on RBF controller intialized with \theta \sim \mathcal{N}(0,I)
+        u = Controller.compute_action(x_t1) # apply a random force of x \in [-10,10] newtons based on RBF controller intialized with \theta \sim \mathcal{N}(0,I)
         x_t2 = Env.step(x_t1, u)
 
         X.append(jnp.hstack((x_t1,u)))
@@ -134,7 +151,7 @@ Y_Final = Y1
 
 # Step 2: PILCO Main Loop
 
-RBF_Kernel = jk.RBF(active_dims=[0,1,2,3,4])
+RBF_Kernel = jk.RBF(active_dims=[0, 1, 2, 3, 4])
 
 for rollout in range(num_rollouts):
     print("PILCO Iteration " + str(rollout + 1))
@@ -155,6 +172,7 @@ for rollout in range(num_rollouts):
 
     M_ts1 = X_Final[0] + Y_Final[0].mean()
     S_ts1 = np.cov(Y_Final[0])
+    Costs = []
 
     # Create Dynamics Model Data for each GP
     for i in range(num_outputs):
@@ -203,6 +221,7 @@ for rollout in range(num_rollouts):
     ## Helper Functions
 
     for T_Step in range(T):
+        print('PILCO Iteration ' + str(rollout +1) + 'at t=' + str(T))
 
         # Propagate through GP dynamics models to calculate J^{\pi}(\theta)
         
@@ -244,96 +263,100 @@ for rollout in range(num_rollouts):
 
         DeltaSigma = []
 
-        for a in range(num_outputs):
+        if CalcCov:
+            for a in range(num_outputs):
 
-            DeltaSigma_Row = []
+                DeltaSigma_Row = []
 
-            for b in range(num_outputs):
+                for b in range(num_outputs):
 
-                GP_Params_A, _ = DynamicsModels[a].unpack()
-                GP_Params_B, _ = DynamicsModels[b].unpack()
+                    GP_Params_A, _ = DynamicsModels[a].unpack()
+                    GP_Params_B, _ = DynamicsModels[b].unpack()
 
-                GP_Ax = DynamicsModelsData[a].X
-                GP_Ay = DynamicsModelsData[a].y
+                    GP_Ax = DynamicsModelsData[a].X
+                    GP_Ay = DynamicsModelsData[a].y
 
-                GP_Bx = DynamicsModelsData[b].X
-                GP_By = DynamicsModelsData[b].y
+                    GP_Bx = DynamicsModelsData[b].X
+                    GP_By = DynamicsModelsData[b].y
 
-                K_A = RBF_Kernel.cross_covariance(GP_Params_A['kernel'], GP_Ax, GP_Ax)
-                K_B = RBF_Kernel.cross_covariance(GP_Params_B['kernel'], GP_Bx, GP_Bx)
+                    K_A = RBF_Kernel.cross_covariance(GP_Params_A['kernel'], GP_Ax, GP_Ax)
+                    K_B = RBF_Kernel.cross_covariance(GP_Params_B['kernel'], GP_Bx, GP_Bx)
 
-                Beta_A = jnp.linalg.inv(K_A) @ GP_Ay
+                    Beta_A = jnp.linalg.inv(K_A) @ GP_Ay
 
-                Beta_B = jnp.linalg.inv(K_B) @ GP_Bx
+                    Beta_B = jnp.linalg.inv(K_B) @ GP_Bx
 
-                Q = []
+                    Q = []
 
-                Lambda_A = jnp.diag(GP_Params_A['kernel']['lengthscale'])
+                    Lambda_A = jnp.diag(GP_Params_A['kernel']['lengthscale'])
 
-                Lambda_B = jnp.diag(GP_Params_B['kernel']['lengthscale'])
+                    Lambda_B = jnp.diag(GP_Params_B['kernel']['lengthscale'])
 
-                R = S_ts1 * (jnp.linalg.inv(Lambda_A) + jnp.linalg.inv(Lambda_B)) + jnp.eye(num_outputs + 1)
+                    R = S_ts1 * (jnp.linalg.inv(Lambda_A) + jnp.linalg.inv(Lambda_B)) + jnp.eye(num_outputs + 1)
 
-                R_Prime = jnp.sqrt(jnp.abs(jnp.linalg.det(R)))
+                    R_Prime = jnp.sqrt(jnp.abs(jnp.linalg.det(R)))
 
-                for i in X_Final: # Calculate Entries of Q_ij
+                    for i in X_Final: # Calculate Entries of Q_ij
 
-                    Q_Row = []
+                        Q_Row = []
 
-                    for j in X_Final:
+                        for j in X_Final:
 
-                        k_a = RBF_Kernel.__call__(GP_Params_A['kernel'], i, M_ts1)
+                            k_a = RBF_Kernel.__call__(GP_Params_A['kernel'], i, M_ts1)
 
-                        k_b = RBF_Kernel.__call__(GP_Params_B['kernel'], j, M_ts1)
+                            k_b = RBF_Kernel.__call__(GP_Params_B['kernel'], j, M_ts1)
 
-                        z = (jnp.linalg.inv(Lambda_A) @ (i - M_ts1)) + (jnp.linalg.inv(Lambda_B) @ (j - M_ts1))
+                            z = (jnp.linalg.inv(Lambda_A) @ (i - M_ts1)) + (jnp.linalg.inv(Lambda_B) @ (j - M_ts1))
 
-                        A = (k_a * k_b) / R_Prime
+                            A = (k_a * k_b) / R_Prime
 
-                        B = jnp.exp(0.5 * (jnp.transpose(z) @ jnp.linalg.inv(R) @ (S_ts1 * z)))
+                            B = jnp.exp(0.5 * (jnp.transpose(z) @ jnp.linalg.inv(R) @ (S_ts1 * z)))
 
-                        Q_Row.append(jnp.nan_to_num(A*B))
+                            Q_Row.append(jnp.nan_to_num(A*B))
 
-                        print('Calculating Q_' + str(i) + str(j) + ' @ ' + '(' + str(a) + ', ' + str(b) + ') = ' + str(A*B))
+                            print('Calculating Q_' + str(i) + str(j) + ' @ ' + '(' + str(a) + ', ' + str(b) + ') = ' + str(A*B))
 
-                    Q.append(Q_Row)
+                        Q.append(Q_Row)
 
-                Q = jnp.asarray(Q)
+                    Q = jnp.asarray(Q)
 
-                K_a = RBF_Kernel.cross_covariance(GP_Params_A['kernel'], GP_Ax, GP_Ax)
+                    E_fts1 = 1 - jnp.trace(K_A @ Q)
 
-                E_fts1 = 1 - jnp.trace(K_a @ Q)
+                    print(E_fts1)
 
-                print(E_fts1)
+                    E_fxts1 =  jnp.mean((jnp.transpose(Beta_A) @ Q @ Beta_B))
 
-                E_fxts1 =  jnp.mean((jnp.transpose(Beta_A) @ Q @ Beta_B))
+                    print(E_fxts1)
 
-                print(E_fxts1)
+                    if (a == b):
+                        s_aa = E_fts1 + E_fxts1 - (DeltaMu[a] * DeltaMu[a])
+                        DeltaSigma_Row.append(jnp.nan_to_num(s_aa))
+                        print(s_aa)
+                    else:
+                        s_ab = E_fxts1 - DeltaMu[a] * DeltaMu[b]
+                        DeltaSigma_Row.append(jnp.nan_to_num(s_ab))
+                        print(s_ab)  
 
-                if (a == b):
-                    s_aa = E_fts1 + E_fxts1 - (DeltaMu[a] * DeltaMu[a])
-                    DeltaSigma_Row.append(jnp.nan_to_num(s_aa))
-                    print(s_aa)
-                else:
-                    s_ab = E_fxts1 - DeltaMu[a] * DeltaMu[b]
-                    DeltaSigma_Row.append(jnp.nan_to_num(s_ab))
-                    print(s_ab)  
+                DeltaSigma_Row = jnp.asarray(DeltaSigma_Row)
+                DeltaSigma.append(DeltaSigma_Row)
 
-            DeltaSigma_Row = jnp.asarray(DeltaSigma_Row)
-            DeltaSigma.append(DeltaSigma_Row)
+            DeltaSigma = jnp.asarray(DeltaSigma)
 
-        DeltaSigma = jnp.asarray(DeltaSigma)
+        DeltaSigma = jnp.eye(4)
 
         # Calculate N(x_t | \mu_{t}, \Sigma_{x_{t})
 
-        pdb.set_trace()
-
         M_t = M_ts1[:4] + DeltaMu.flatten()
-
         S_t = S_ts1 + DeltaSigma.flatten().reshape(4,4)
 
         N_t = dx.MultivariateNormalFullCovariance(M_t, S_t)
 
         x_t = N_t.sample(seed=key)
+        u_t = Controller.compute_action(x_t)
+
+        Cost = spint.quad_vec(J_under_pi,T_Step, T_Step+1, args=(Target, M_t, S_t))
+        Costs.append(Cost)
 
     # Evaluate J^{\pi}
+
+    J = sum(Costs)
