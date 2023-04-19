@@ -107,9 +107,13 @@ class RBFController():
             sum.append(jnp.dot(w, phi))
 
         return jnp.sum(jnp.asarray(sum))
+
+### Calculate Mean
+
+
     
 def J_under_pi(x, t, m, s):
-    return (1 - jnp.exp(-((jnp.abs(x - t)**2 )/0.25))) * ((jnp.exp(-0.5 * (x - m).T @ s.T @ (x-m))) / (jnp.sqrt( 2 * jnp.pi )**4 * jnp.linalg.det(s)))
+    return 1 - (jnp.exp(-((jnp.abs(x - t)**2 )/0.25))) * ((jnp.exp(-0.5 * (x - m).T @ s.T @ (x-m))) / (jnp.sqrt( 2 * jnp.pi )**4 * jnp.linalg.det(s)))
 
 
 ### PILCO
@@ -221,7 +225,7 @@ for rollout in range(num_rollouts):
     ## Helper Functions
 
     for T_Step in range(T):
-        print('PILCO Iteration ' + str(rollout +1) + 'at t=' + str(T))
+        print('PILCO Iteration ' + str(rollout +1) + ' at t = ' + str(T_Step))
 
         # Propagate through GP dynamics models to calculate J^{\pi}(\theta)
         
@@ -353,10 +357,8 @@ for rollout in range(num_rollouts):
 
         x_t = N_t.sample(seed=key)
         u_t = Controller.compute_action(x_t)
-
+        
         Cost = spint.quad_vec(J_under_pi,T_Step, T_Step+1, args=(Target, M_t, S_t))
         Costs.append(Cost)
 
     # Evaluate J^{\pi}
-
-    J = sum(Costs)
